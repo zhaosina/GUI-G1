@@ -128,6 +128,14 @@ class GRPOScriptArguments(ScriptArguments):
 class GRPOModelConfig(ModelConfig):
     freeze_vision_modules: bool = False
 
+SYSTEM_PROMPT = (
+    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
+    "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+    "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
+    "<think> reasoning process here </think><answer> answer here </answer>"
+)
+
+
 class LazySupervisedDataset(Dataset):
     def __init__(self, data_path: str, script_args: GRPOScriptArguments):
         super(LazySupervisedDataset, self).__init__()
@@ -188,7 +196,7 @@ class LazySupervisedDataset(Dataset):
                 ],
             }
         QUESTION_TEMPLATE = "Grounding instruction is: {}. Report the bbox coordinates in JSON format."
-        def make_conversation_image(example):
+        def make_conversation_image(example, image):
             return {
                 "prompt": [
                     {
@@ -214,12 +222,19 @@ class LazySupervisedDataset(Dataset):
         else:
             image = None
 
+        prompt_messages = (
+            make_conversation_image(example, image)['prompt']
+            if 'image' in example
+            else make_conversation(example)['prompt']
+        )
+
         return {
             'image': image,
+            'prompt_image': image.copy() if image is not None else None,
             'problem': example['problem'],
             'solution': example['solution'],
             'rate': example['rate'],
-            'prompt': make_conversation_image(example)['prompt'] if 'image' in example else make_conversation(example)['prompt'],
+            'prompt': prompt_messages,
         }
 
 def iou_reward(completions, solution, **kwargs):

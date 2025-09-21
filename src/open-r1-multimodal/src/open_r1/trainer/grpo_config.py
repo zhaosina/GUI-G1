@@ -128,6 +128,42 @@ class GRPOConfig(TrainingArguments):
             "argument of the `GRPOTrainer` is provided as a string."
         },
     )
+    enable_multi_turn: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable multi-turn training with iterative error hints and refreshed masked images.",
+        },
+    )
+    multi_turn_max_turns: int = field(
+        default=3,
+        metadata={
+            "help": "Maximum number of turns to allow for each sample when multi-turn training is active.",
+        },
+    )
+    multi_turn_success_threshold: float = field(
+        default=0.9,
+        metadata={
+            "help": "Minimum aggregated reward required to stop the dialogue early in multi-turn training.",
+        },
+    )
+    multi_turn_visible_ratio: float = field(
+        default=0.5,
+        metadata={
+            "help": "Minimum fraction of the original image width and height that remains visible when creating masked hints.",
+        },
+    )
+    log_multi_turn_conversations: bool = field(
+        default=False,
+        metadata={
+            "help": "Persist multi-turn conversation transcripts, hints, and metadata for later inspection.",
+        },
+    )
+    conversation_log_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional directory to store multi-turn conversation logs. Defaults to `<output_dir>/multi_turn_logs` when unset.",
+        },
+    )
 
     # Parameters that control the data preprocessing
     # The default value remove_unused_columns is overwritten from the parent class, because in GRPO we usually rely on
