@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
+import json
 import os
 import textwrap
 from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Optional, Union, Sized
 
 import torch
@@ -48,10 +52,13 @@ from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
 from accelerate.utils import is_peft_model, set_seed
 import PIL.Image
+from PIL import ImageDraw
 
 import copy
 from torch.utils.data import Sampler
 import warnings
+
+from torch.nn.utils.rnn import pad_sequence
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -386,6 +393,20 @@ class Qwen2VLGRPOTrainer(Trainer):
         # Buffer the batch to reuse generated outputs across multiple updates
         self._buffered_inputs = [None] * args.gradient_accumulation_steps
 
+        # Multi-turn training configuration
+        self.enable_multi_turn = args.enable_multi_turn
+        self.multi_turn_max_turns = max(1, args.multi_turn_max_turns)
+        self.multi_turn_success_threshold = args.multi_turn_success_threshold
+        self.multi_turn_visible_ratio = max(0.0, min(1.0, args.multi_turn_visible_ratio))
+        self.log_multi_turn_conversations = args.log_multi_turn_conversations
+        if self.log_multi_turn_conversations:
+            default_dir = Path(args.output_dir) / "multi_turn_logs"
+            log_dir = Path(args.conversation_log_dir) if args.conversation_log_dir is not None else default_dir
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self.conversation_log_dir = log_dir
+        else:
+            self.conversation_log_dir = None
+
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
         # "input_ids" key. Instead, the available keys is "prompt". As a result, the trainer issues the warning:
@@ -497,32 +518,43 @@ class Qwen2VLGRPOTrainer(Trainer):
         # Simple pass-through, just like original
         return inputs
 
-    def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]], model) -> dict[str, Union[torch.Tensor, Any]]:
-        device = self.accelerator.device
-        prompts = [x["prompt"] for x in inputs]
-        rates = [x["rate"] for x in inputs]
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        # Handle both pre-loaded images and image paths
-        images = []
-        for x in inputs:
-            if "image" in x:
-                img = x["image"]
+    def _prepare_image_for_prompt(self, image):
+        if image is None:
+            return None
+        if isinstance(image, PIL.Image.Image):
+            img = image.copy()
+        else:
+            img = PIL.Image.open(image)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        w, h = img.size
+        if w < 28 or h < 28:
+            if w < h:
+                scale = 28 / max(w, 1)
+                new_w = 28
+                new_h = max(28, int(h * scale))
             else:
-                img = PIL.Image.open(x["image_path"])
+                scale = 28 / max(h, 1)
+                new_h = 28
+                new_w = max(28, int(w * scale))
+            img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
+        return img
 
-            # Ensure minimum dimensions of 28 pixels
-            w, h = img.size
-            if w < 28 or h < 28:
-                # Calculate new dimensions maintaining aspect ratio
-                if w < h:
-                    new_w = 28
-                    new_h = int(h * (28/w))
-                else:
-                    new_h = 28
-                    new_w = int(w * (28/h))
-                img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
-            
-            images.append(img)
+    def _prepare_prompt_batch(self, examples: list[dict[str, Any]]):
+        prompts = [example["prompt"] for example in examples]
+        rates = [example["rate"] for example in examples]
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in examples]
+        images = []
+        for example in examples:
+            img = example.get("prompt_image", example.get("image"))
+            if img is None and "image_path" in example:
+                img = example["image_path"]
+            images.append(self._prepare_image_for_prompt(img))
+        return prompts, rates, prompts_text, images
+
+    def _generate_single_turn_outputs(self, inputs: list[dict[str, Any]], model):
+        device = self.accelerator.device
+        prompts, rates, prompts_text, images = self._prepare_prompt_batch(inputs)
 
         prompt_inputs = self.processing_class(
             text=prompts_text,
@@ -535,43 +567,33 @@ class Qwen2VLGRPOTrainer(Trainer):
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
 
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
-        pixel_values = prompt_inputs["pixel_values"]
-        image_grid_thw = prompt_inputs["image_grid_thw"]
+        pixel_values = prompt_inputs.get("pixel_values")
+        image_grid_thw = prompt_inputs.get("image_grid_thw")
 
-        
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_inputs["input_ids"] = prompt_ids
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
             prompt_inputs["attention_mask"] = prompt_mask
 
-        # Generate completions
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
             prompt_completion_ids = unwrapped_model.generate(
-                **prompt_inputs, 
-                generation_config=self.generation_config
+                **prompt_inputs,
+                generation_config=self.generation_config,
             )
-
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
-            # No need to repeat prompt_mask as we're not duplicating prompts during generation
 
-        # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-        # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
-        pixel_values = prompt_inputs["pixel_values"]
-        image_grid_thw = prompt_inputs["image_grid_thw"]
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
         with torch.no_grad():
-            # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its
-            # computation here, and use per_token_logps.detach() instead.
             if self.num_iterations > 1:
                 old_per_token_logps = self._get_per_token_logps(
                     model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw
@@ -594,18 +616,12 @@ class Qwen2VLGRPOTrainer(Trainer):
         if ref_per_token_logps is not None:
             ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1:]
 
-        # Decode the generated completions
         completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
             completions = [[{"role": "assistant", "content": completion}] for completion in completions]
 
-        # Compute the rewards
-        # No need to duplicate prompts as we're not generating multiple completions per prompt
-
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
-        for i, (reward_func, reward_processing_class) in enumerate(
-            zip(self.reward_funcs, self.reward_processing_classes)
-        ):
+        for i, (reward_func, reward_processing_class) in enumerate(zip(self.reward_funcs, self.reward_processing_classes)):
             if isinstance(reward_func, PreTrainedModel):
                 if is_conversational(inputs[0]):
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
@@ -617,57 +633,215 @@ class Qwen2VLGRPOTrainer(Trainer):
                 )
                 reward_inputs = super()._prepare_inputs(reward_inputs)
                 with torch.inference_mode():
-                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
             else:
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                 reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
                 for key in reward_kwargs:
                     for example in inputs:
-                        # Repeat each value in the column for `num_generations` times
                         reward_kwargs[key].extend([example[key]] * self.num_generations)
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
-        # Gather rewards across processes
-        rewards_per_func = self.accelerator.gather(rewards_per_func)
-        
-        # Sum the rewards from all reward functions
-        rewards = rewards_per_func.sum(dim=1)
-        
-        # Compute grouped-wise rewards
-        # Each group consists of num_generations completions for the same prompt
+        return {
+            "prompts": prompts,
+            "rates": rates,
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "old_per_token_logps": old_per_token_logps,
+            "ref_per_token_logps": ref_per_token_logps,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "rewards_per_func": rewards_per_func,
+            "completions": completions,
+        }
+
+    def _strip_previous_image_reference(self, conversation: list[dict[str, Any]]):
+        for message in reversed(conversation):
+            content = message.get("content")
+            if message.get("role") == "user" and isinstance(content, list):
+                if any(part.get("type") == "image" for part in content):
+                    text_segments = [part.get("text", "") for part in content if part.get("type") == "text"]
+                    text = text_segments[0] if text_segments else ""
+                    replacement = text if text else "[Image omitted]"
+                    message["content"] = [{"type": "text", "text": f"[Image omitted] {replacement}".strip()}]
+                    return text
+        return ""
+
+    def _as_text_content(self, text: str):
+        return [{"type": "text", "text": text}]
+
+    def _parse_bbox_from_completion(self, completion: str | None):
+        if not completion:
+            return None
+        text = completion
+        if "<answer>" in text and "</answer>" in text:
+            text = text.split("<answer>", 1)[1].split("</answer>", 1)[0]
+        if "```json" in text:
+            text = text.split("```json", 1)[1]
+            text = text.split("```", 1)[0]
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                parsed = ast.literal_eval(text)
+            except Exception:
+                return None
+        if isinstance(parsed, dict):
+            candidate = parsed.get("bbox_2d") or parsed.get("bbox") or parsed.get("box")
+            if candidate and len(candidate) == 4:
+                return tuple(float(x) for x in candidate)
+        elif isinstance(parsed, list) and parsed:
+            first = parsed[0]
+            if isinstance(first, dict):
+                candidate = first.get("bbox_2d") or first.get("bbox") or first.get("box")
+                if candidate and len(candidate) == 4:
+                    return tuple(float(x) for x in candidate)
+            elif isinstance(first, (list, tuple)) and len(first) == 4:
+                return tuple(float(x) for x in first)
+        return None
+
+    def _create_masked_image(self, image: PIL.Image.Image | None, bbox: Any):
+        if image is None or bbox is None:
+            return None
+        img = image.copy().convert("RGBA")
+        width, height = img.size
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        box_w = max(1.0, x2 - x1)
+        box_h = max(1.0, y2 - y1)
+        min_w = width * self.multi_turn_visible_ratio
+        min_h = height * self.multi_turn_visible_ratio
+        target_w = max(box_w, min_w)
+        target_h = max(box_h, min_h)
+        left = max(0, int(center_x - target_w / 2))
+        right = min(width, int(center_x + target_w / 2))
+        top = max(0, int(center_y - target_h / 2))
+        bottom = min(height, int(center_y + target_h / 2))
+        overlay = PIL.Image.new("RGBA", img.size, (0, 0, 0, 180))
+        overlay.paste(PIL.Image.new("RGBA", (right - left, bottom - top), (0, 0, 0, 0)), (left, top))
+        combined = PIL.Image.alpha_composite(img, overlay)
+        draw = ImageDraw.Draw(combined)
+        draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0, 255), width=3)
+        return combined.convert("RGB")
+
+    def _build_error_hint_text(self, predicted_bbox, target_bbox, image_size):
+        if target_bbox is None:
+            return "Focus on the highlighted region and return the bbox_2d coordinates in JSON format."
+        gx1, gy1, gx2, gy2 = [float(v) for v in target_bbox]
+        width, height = image_size
+        if predicted_bbox is None:
+            return (
+                "Hint: The previous response was invalid. Use the highlighted area and report bbox_2d coordinates close to "
+                f"{[round(gx1, 2), round(gy1, 2), round(gx2, 2), round(gy2, 2)]}."
+            )
+        px1, py1, px2, py2 = predicted_bbox
+        px_center = (px1 + px2) / 2
+        py_center = (py1 + py2) / 2
+        gx_center = (gx1 + gx2) / 2
+        gy_center = (gy1 + gy2) / 2
+        tol_x = width * 0.01
+        tol_y = height * 0.01
+        hints = []
+        if px_center < gx_center - tol_x:
+            hints.append("shift the box to the right")
+        elif px_center > gx_center + tol_x:
+            hints.append("shift the box to the left")
+        if py_center < gy_center - tol_y:
+            hints.append("move the box downward")
+        elif py_center > gy_center + tol_y:
+            hints.append("move the box upward")
+        pred_w = max(1.0, px2 - px1)
+        pred_h = max(1.0, py2 - py1)
+        tgt_w = gx2 - gx1
+        tgt_h = gy2 - gy1
+        if pred_w < tgt_w * 0.9:
+            hints.append("widen the box")
+        elif pred_w > tgt_w * 1.1:
+            hints.append("narrow the width")
+        if pred_h < tgt_h * 0.9:
+            hints.append("increase the height")
+        elif pred_h > tgt_h * 1.1:
+            hints.append("reduce the height")
+        if not hints:
+            hints.append("align the box with the highlighted region")
+        guidance = ", ".join(hints)
+        return (
+            f"Hint: The previous box { [round(px1, 2), round(py1, 2), round(px2, 2), round(py2, 2)] } missed the target. "
+            f"Please {guidance} and report bbox_2d close to {[round(gx1, 2), round(gy1, 2), round(gx2, 2), round(gy2, 2)]}."
+        )
+
+    def _persist_masked_image(self, image: PIL.Image.Image | None, sample_idx: int, turn_idx: int):
+        if image is None or self.conversation_log_dir is None:
+            return None
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        file_name = f"step{self.state.global_step:06d}_sample{sample_idx:04d}_turn{turn_idx + 1}.png"
+        path = self.conversation_log_dir / file_name
+        try:
+            image.save(path)
+        except Exception:
+            return None
+        return str(path)
+
+    def _log_multi_turn_conversations(self, entries: list[dict[str, Any]]):
+        if not entries or self.conversation_log_dir is None:
+            return
+        log_path = self.conversation_log_dir / "conversations.jsonl"
+        with log_path.open("a", encoding="utf-8") as fp:
+            for entry in entries:
+                fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _generate_single_turn(self, inputs: list[dict[str, Any]], model):
+        outputs = self._generate_single_turn_outputs(inputs, model)
+        prompts = outputs["prompts"]
+        rates = outputs["rates"]
+        prompt_ids = outputs["prompt_ids"]
+        prompt_mask = outputs["prompt_mask"]
+        completion_ids = outputs["completion_ids"]
+        completion_mask = outputs["completion_mask"]
+        old_per_token_logps = outputs["old_per_token_logps"]
+        ref_per_token_logps = outputs["ref_per_token_logps"]
+        pixel_values = outputs["pixel_values"]
+        image_grid_thw = outputs["image_grid_thw"]
+        rewards_per_func_local = outputs["rewards_per_func"]
+
+        rewards_per_func_global = self.accelerator.gather(rewards_per_func_local)
+        rewards = rewards_per_func_global.sum(dim=1)
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-        
-        # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        ## Fix
-        advantages = (rewards - mean_grouped_rewards)
-        # advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-
-        # Get only the local slice of advantages
+        advantages = rewards - mean_grouped_rewards
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
         )
-        advantages = advantages[process_slice]
+        local_advantages = advantages[process_slice]
 
-        # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics["completion_length"].append(completion_length)
 
-        reward_per_func = self.accelerator.gather_for_metrics(rewards_per_func).mean(0)
+        reward_metrics = self.accelerator.gather_for_metrics(rewards_per_func_local).mean(0)
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 reward_func_name = reward_func.config._name_or_path.split("/")[-1]
             else:
                 reward_func_name = reward_func.__name__
-            self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
+            self._metrics[f"rewards/{reward_func_name}"].append(reward_metrics[i].item())
 
-        self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
-
-        self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
+        self._metrics["reward"].append(
+            self.accelerator.gather_for_metrics(rewards_per_func_local.sum(dim=1)).mean().item()
+        )
+        self._metrics["reward_std"].append(
+            self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item()
+        )
 
         return {
             "prompt_ids": prompt_ids,
@@ -676,11 +850,258 @@ class Qwen2VLGRPOTrainer(Trainer):
             "completion_mask": completion_mask,
             "old_per_token_logps": old_per_token_logps,
             "ref_per_token_logps": ref_per_token_logps,
-            "advantages": advantages,
+            "advantages": local_advantages,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
-            "rates": rates
+            "rates": rates,
         }
+
+    def _generate_multi_turn(self, inputs: list[dict[str, Any]], model):
+        device = self.accelerator.device
+        num_samples = len(inputs)
+        if num_samples == 0:
+            return {
+                "prompt_ids": torch.empty(0, dtype=torch.long, device=device),
+                "prompt_mask": torch.empty(0, dtype=torch.long, device=device),
+                "completion_ids": torch.empty(0, dtype=torch.long, device=device),
+                "completion_mask": torch.empty(0, dtype=torch.long, device=device),
+                "old_per_token_logps": None,
+                "ref_per_token_logps": None,
+                "advantages": torch.empty(0, device=device),
+                "pixel_values": None,
+                "image_grid_thw": None,
+                "rates": [],
+            }
+
+        for example in inputs:
+            if example.get("prompt_image") is None:
+                example["prompt_image"] = example.get("image")
+
+        conversation_states = [copy.deepcopy(example["prompt"]) for example in inputs]
+        original_images = [example.get("image") for example in inputs]
+        solutions = [example.get("solution") for example in inputs]
+        conversation_logs: list[list[dict[str, Any]]] = [[] for _ in range(num_samples)]
+        final_outputs: list[dict[str, Any] | None] = [None] * num_samples
+        rewards_records: list[torch.Tensor | None] = [None] * num_samples
+        success_records = [False] * num_samples
+        remaining = list(range(num_samples))
+
+        for turn_idx in range(self.multi_turn_max_turns):
+            if not remaining:
+                break
+            active_examples = []
+            for idx in remaining:
+                example = dict(inputs[idx])
+                example["prompt"] = conversation_states[idx]
+                example["prompt_image"] = example.get("prompt_image", inputs[idx].get("prompt_image"))
+                active_examples.append(example)
+
+            outputs = self._generate_single_turn_outputs(active_examples, model)
+            completions = outputs["completions"]
+            rewards_per_func_local = outputs["rewards_per_func"]
+            prompt_ids = outputs["prompt_ids"]
+            prompt_mask = outputs["prompt_mask"]
+            completion_ids = outputs["completion_ids"]
+            completion_mask = outputs["completion_mask"]
+            old_per_token_logps = outputs["old_per_token_logps"]
+            ref_per_token_logps = outputs["ref_per_token_logps"]
+            pixel_values = outputs["pixel_values"]
+            image_grid_thw = outputs["image_grid_thw"]
+
+            aggregated_rewards = rewards_per_func_local.sum(dim=1)
+            success_mask = aggregated_rewards >= self.multi_turn_success_threshold
+            if turn_idx == self.multi_turn_max_turns - 1:
+                success_mask = torch.ones_like(success_mask, dtype=torch.bool, device=success_mask.device)
+
+            new_remaining = []
+            for local_idx, sample_idx in enumerate(remaining):
+                completion_entry = completions[local_idx]
+                completion_text = completion_entry[0]["content"] if is_conversational(inputs[0]) else completion_entry
+                reward_row = rewards_per_func_local[local_idx].detach()
+                aggregated_reward = aggregated_rewards[local_idx].item()
+                parsed_bbox = self._parse_bbox_from_completion(completion_text)
+                log_entry: dict[str, Any] = {
+                    "turn": turn_idx + 1,
+                    "response": completion_text,
+                    "reward_per_func": reward_row.tolist(),
+                    "reward": aggregated_reward,
+                }
+
+                if success_mask[local_idx]:
+                    final_outputs[sample_idx] = {
+                        "prompt_ids": prompt_ids[local_idx],
+                        "prompt_mask": prompt_mask[local_idx],
+                        "completion_ids": completion_ids[local_idx],
+                        "completion_mask": completion_mask[local_idx],
+                        "old_per_token_logps": None if old_per_token_logps is None else old_per_token_logps[local_idx],
+                        "ref_per_token_logps": None if ref_per_token_logps is None else ref_per_token_logps[local_idx],
+                        "pixel_values": None if pixel_values is None else pixel_values[local_idx],
+                        "image_grid_thw": None if image_grid_thw is None else image_grid_thw[local_idx],
+                    }
+                    rewards_records[sample_idx] = reward_row
+                    success_records[sample_idx] = True
+                    if parsed_bbox is not None:
+                        log_entry["predicted_bbox"] = [round(float(v), 2) for v in parsed_bbox]
+                    if solutions[sample_idx] is not None:
+                        log_entry["ground_truth_bbox"] = [round(float(v), 2) for v in solutions[sample_idx]]
+                    log_entry["success"] = True
+                    conversation_logs[sample_idx].append(log_entry)
+                else:
+                    previous_text = self._strip_previous_image_reference(conversation_states[sample_idx])
+                    conversation_states[sample_idx].append(
+                        {"role": "assistant", "content": self._as_text_content(completion_text)}
+                    )
+                    hint_text = self._build_error_hint_text(
+                        parsed_bbox,
+                        solutions[sample_idx],
+                        original_images[sample_idx].size if original_images[sample_idx] is not None else (1, 1),
+                    )
+                    masked_image = self._create_masked_image(original_images[sample_idx], solutions[sample_idx])
+                    if masked_image is None:
+                        masked_image = self._prepare_image_for_prompt(inputs[sample_idx].get("prompt_image"))
+                    inputs[sample_idx]["prompt_image"] = masked_image
+                    conversation_states[sample_idx].append(
+                        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": hint_text}]}
+                    )
+                    saved_path = self._persist_masked_image(masked_image, sample_idx, turn_idx)
+                    if parsed_bbox is not None:
+                        log_entry["predicted_bbox"] = [round(float(v), 2) for v in parsed_bbox]
+                    if solutions[sample_idx] is not None:
+                        log_entry["ground_truth_bbox"] = [round(float(v), 2) for v in solutions[sample_idx]]
+                    log_entry.update(
+                        {
+                            "success": False,
+                            "hint": hint_text,
+                            "masked_image_path": saved_path,
+                            "previous_instruction": previous_text,
+                        }
+                    )
+                    conversation_logs[sample_idx].append(log_entry)
+                    new_remaining.append(sample_idx)
+
+            remaining = new_remaining
+
+        for idx, record in enumerate(rewards_records):
+            if record is None:
+                raise ValueError("Multi-turn generation did not produce a completion for every sample.")
+
+        pad_token_id = self.processing_class.pad_token_id
+        prompt_ids = pad_sequence(
+            [output["prompt_ids"] for output in final_outputs],
+            batch_first=True,
+            padding_value=pad_token_id,
+        ).to(device)
+        prompt_mask = pad_sequence(
+            [output["prompt_mask"] for output in final_outputs],
+            batch_first=True,
+            padding_value=0,
+        ).to(device)
+        completion_ids = pad_sequence(
+            [output["completion_ids"] for output in final_outputs],
+            batch_first=True,
+            padding_value=pad_token_id,
+        ).to(device)
+        completion_mask = pad_sequence(
+            [output["completion_mask"] for output in final_outputs],
+            batch_first=True,
+            padding_value=0,
+        ).to(device)
+
+        if final_outputs[0]["old_per_token_logps"] is None:
+            old_per_token_logps = None
+        else:
+            old_per_token_logps = pad_sequence(
+                [output["old_per_token_logps"] for output in final_outputs],
+                batch_first=True,
+                padding_value=0.0,
+            ).to(device)
+
+        if final_outputs[0]["ref_per_token_logps"] is None:
+            ref_per_token_logps = None
+        else:
+            ref_per_token_logps = pad_sequence(
+                [output["ref_per_token_logps"] for output in final_outputs],
+                batch_first=True,
+                padding_value=0.0,
+            ).to(device)
+
+        if final_outputs[0]["pixel_values"] is None:
+            pixel_values = None
+        else:
+            pixel_values = torch.stack([output["pixel_values"] for output in final_outputs]).to(device)
+
+        if final_outputs[0]["image_grid_thw"] is None:
+            image_grid_thw = None
+        else:
+            image_grid_thw = torch.stack([output["image_grid_thw"] for output in final_outputs]).to(device)
+
+        rewards_tensor = torch.stack(rewards_records)
+        rewards_global = self.accelerator.gather(rewards_tensor)
+        rewards = rewards_global.sum(dim=1)
+        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        advantages = rewards - mean_grouped_rewards
+        process_slice = slice(
+            self.accelerator.process_index * num_samples,
+            (self.accelerator.process_index + 1) * num_samples,
+        )
+        local_advantages = advantages[process_slice]
+
+        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+        self._metrics["completion_length"].append(completion_length)
+
+        reward_metrics = self.accelerator.gather_for_metrics(rewards_tensor).mean(0)
+        for i, reward_func in enumerate(self.reward_funcs):
+            if isinstance(reward_func, PreTrainedModel):
+                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+            else:
+                reward_func_name = reward_func.__name__
+            self._metrics[f"rewards/{reward_func_name}"].append(reward_metrics[i].item())
+
+        self._metrics["reward"].append(
+            self.accelerator.gather_for_metrics(rewards_tensor.sum(dim=1)).mean().item()
+        )
+        self._metrics["reward_std"].append(
+            self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item()
+        )
+
+        if self.log_multi_turn_conversations:
+            log_entries = []
+            for idx, turns in enumerate(conversation_logs):
+                if not turns:
+                    continue
+                log_entries.append(
+                    {
+                        "global_step": int(self.state.global_step),
+                        "sample_index": idx,
+                        "problem": inputs[idx].get("problem"),
+                        "solution": inputs[idx].get("solution"),
+                        "turns": turns,
+                        "final_success": success_records[idx],
+                    }
+                )
+            self._log_multi_turn_conversations(log_entries)
+
+        return {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "old_per_token_logps": old_per_token_logps,
+            "ref_per_token_logps": ref_per_token_logps,
+            "advantages": local_advantages,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "rates": [example["rate"] for example in inputs],
+        }
+
+    def _generate_and_score_completions(self, inputs: list[dict[str, Any]], model):
+        if self.enable_multi_turn:
+            return self._generate_multi_turn(inputs, model)
+        return self._generate_single_turn(inputs, model)
+
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
